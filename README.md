@@ -6,7 +6,7 @@
 
 ## 安装
 
-在浏览器安装 Tampermonkey，导入本仓库的 `chaoxing-original-downloader.user.js`，然后刷新超星课程页。使用旧版脚本的用户请先在油猴管理面板停用旧版，以免页面同时出现两个面板。
+在浏览器安装 Tampermonkey，打开 [Greasy Fork 安装页](https://greasyfork.org/zh-CN/scripts/607172)，点击「安装此脚本」并在油猴中确认，然后刷新超星课程页。使用旧版脚本的用户请先在油猴管理面板停用旧版，以免页面同时出现两个面板。
 
 ## 来源与许可
 
