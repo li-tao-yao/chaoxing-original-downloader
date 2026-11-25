@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         Chaoxing 原始课件下载（PPT/PPTX/PDF）
 // @namespace    https://github.com/li-tao-yao/chaoxing-original-downloader
-// @version      0.7.0
-// @description  按章节勾选已开放下载的 PPT、PPTX 和 PDF，保存时保留原扩展名并检查文件头。
-// @name:en      Chaoxing Courseware Downloads
-// @description:en  Save download-enabled course slides and PDFs with their original file extensions.
+// @version      0.8.0
+// @description  按章节勾选下载超星课件：优先保存 PPT/PPTX/PDF 原文件，无原文件时自动回退为 PDF 预览，带文件头校验与批量容错。
+// @name:en      Chaoxing Courseware Downloader (PPT/PPTX/PDF)
+// @description:en  Batch download Chaoxing course slides and PDFs: preserves original PPT/PPTX/PDF files, falls back to converted PDF preview when originals are unavailable, and validates file headers.
 // @homepageURL  https://github.com/li-tao-yao/chaoxing-original-downloader
+// @supportURL   https://github.com/li-tao-yao/chaoxing-original-downloader/issues
 // @license      MIT
 // @match        https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/*
+// @match        https://*.chaoxing.com/mooc2-ans/mycourse/*
 // @match        https://mooc1.chaoxing.com/mycourse/*
+// @match        https://*.chaoxing.com/mycourse/*
 // @grant        GM_xmlhttpRequest
 // @connect      mooc2-ans.chaoxing.com
 // @connect      mooc1.chaoxing.com
@@ -30,6 +33,7 @@
 MIT License
 
 Copyright (c) 2026 Fiatnorm
+Modifications Copyright (c) 2026 li-tao-yao
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -57,9 +61,9 @@ SOFTWARE.
     const CARDS_URL = 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards';
     const STATUS_URL_PREFIX = 'https://mooc1.chaoxing.com/ananas/status/';
     const PDF_REFERER = 'https://mooc1.chaoxing.com/ananas/modules/pdf/index.html?v=2026-0312-1153';
-    const UI_ID = 'cxpdf-dumper-panel';
+    const UI_ID = 'cxorig-downloader-panel';
     const SCRIPT_NAME = 'Chaoxing 原始课件下载';
-    const SCRIPT_VERSION = '0.7.0';
+    const SCRIPT_VERSION = '0.8.0';
     const SCRIPT_ICON_URL = 'https://app.chaoxing.com/res/images/apk/logo.png';
     const VERSION_POLICY = {
         major: 'Breaking changes to supported pages, permissions, data shape, or default behavior.',
@@ -67,6 +71,9 @@ SOFTWARE.
         patch: 'Bug fixes, compatibility fixes, diagnostics, and low-risk maintenance.',
     };
     const LOG_PREFIX = '[Chaoxing Original Downloader]';
+    const ORIGINAL_EXTENSIONS = ['ppt', 'pptx', 'pdf'];
+    const MEDIA_EXTENSIONS = ['mp4', 'm4v', 'mov', 'avi', 'mkv', 'flv', 'wmv', 'webm', 'mp3', 'wav', 'aac', 'flac', 'ogg', 'm4a'];
+    const FALLBACK_STRIP_EXT_RE = /\.(pptx?|ppsx?|docx?|xlsx?|pdf|wps|rtf|txt)$/i;
 
     const state = {
         courseid: '',
@@ -146,10 +153,48 @@ SOFTWARE.
         return '';
     }
 
+    function itemExtensionHint(item) {
+        const ext = originalExtension(item);
+        if (ext) {
+            return ext;
+        }
+        for (const hint of [item.suffix, item.type]) {
+            const cleaned = cleanText(hint).replace(/^\./, '').toLowerCase();
+            if (/^[a-z0-9]+$/.test(cleaned)) {
+                return cleaned;
+            }
+        }
+        return '';
+    }
+
+    function hasHttpUrl(value) {
+        return typeof value === 'string' && /^https?:\/\//i.test(value.trim());
+    }
+
     function isDownloadableOriginal(item) {
-        return ['ppt', 'pptx', 'pdf'].includes(originalExtension(item))
-            && typeof item.download === 'string'
-            && /^https?:\/\//i.test(item.download);
+        return ORIGINAL_EXTENSIONS.includes(originalExtension(item)) && hasHttpUrl(item.download);
+    }
+
+    function isDownloadablePdfPreview(item) {
+        const hint = itemExtensionHint(item);
+        if (MEDIA_EXTENSIONS.includes(hint)) {
+            return false;
+        }
+        return hasHttpUrl(item.pdf);
+    }
+
+    function resolveDownloadMode(item) {
+        if (isDownloadableOriginal(item)) {
+            return 'original';
+        }
+        if (isDownloadablePdfPreview(item)) {
+            return 'pdf-preview';
+        }
+        return 'none';
+    }
+
+    function isDownloadableItem(item) {
+        return resolveDownloadMode(item) !== 'none';
     }
 
     function currentPageUrl() {
@@ -178,11 +223,18 @@ SOFTWARE.
             return getSearchParamCaseInsensitive(pageUrl, 'pageHeader') === '1';
         }
 
+        if (isMooc1StudentCoursePage(pageUrl)) {
+            return Boolean(
+                getSearchParamCaseInsensitive(pageUrl, 'courseid')
+                && getSearchParamCaseInsensitive(pageUrl, 'clazzid')
+            );
+        }
+
         return isMooc1StudentStudyPage(pageUrl) && hasCurrentChapterParams(pageUrl);
     }
 
     function canScanCurrentPage(pageUrl = currentPageUrl()) {
-        if (isMooc2CoursePage(pageUrl)) {
+        if (isMooc2CoursePage(pageUrl) || isMooc1StudentCoursePage(pageUrl)) {
             return Boolean(
                 getSearchParamCaseInsensitive(pageUrl, 'courseid')
                 && getSearchParamCaseInsensitive(pageUrl, 'clazzid')
@@ -204,12 +256,20 @@ SOFTWARE.
         return `course::${getSearchParamCaseInsensitive(pageUrl, 'courseid')}::${getSearchParamCaseInsensitive(pageUrl, 'clazzid')}`;
     }
 
+    function isChaoxingHost(url) {
+        return /(?:^|\.)chaoxing\.com$/i.test(url.hostname);
+    }
+
     function isMooc2CoursePage(url) {
-        return url.hostname === 'mooc2-ans.chaoxing.com' && url.pathname.startsWith('/mooc2-ans/mycourse/');
+        return isChaoxingHost(url) && url.pathname.startsWith('/mooc2-ans/mycourse/');
     }
 
     function isMooc1StudentStudyPage(url) {
-        return url.hostname === 'mooc1.chaoxing.com' && url.pathname.startsWith('/mycourse/studentstudy');
+        return isChaoxingHost(url) && url.pathname.startsWith('/mycourse/studentstudy');
+    }
+
+    function isMooc1StudentCoursePage(url) {
+        return isChaoxingHost(url) && url.pathname.startsWith('/mycourse/studentcourse');
     }
 
     function hasCurrentChapterParams(url) {
@@ -399,35 +459,39 @@ SOFTWARE.
     function parseAttachments(html) {
         const doc = parseHtml(html);
         const byObjectId = new Map();
-
-        // The native document viewer disables its download action for teaching packages.
-        // Accept literal appInfo lists. When a page computes the setting, skip the page.
-        for (const script of doc.querySelectorAll('script:not([src])')) {
-            const values = script.textContent.matchAll(/(?:["']?\bappInfo["']?)\s*[:=]\s*([^;\r\n}]+)/gi);
-            for (const [, expression] of values) {
-                const literal = expression.match(/^["']([\d,\s]*)["']\s*(?:,|$)/);
-                if (!literal || literal[1].split(',').some(value => Number(value.trim()) === 6)) {
-                    return [];
-                }
+        const addAttachment = (objectid, data) => {
+            const id = cleanText(objectid);
+            if (!id) {
+                return;
             }
+
+            const existing = byObjectId.get(id) || {};
+            byObjectId.set(id, Object.assign({}, data || {}, existing, { objectid: id }));
+        };
+
+        Array.from(doc.querySelectorAll('iframe[data]')).forEach((iframe) => {
+            const data = parseAttachmentData(iframe.getAttribute('data'));
+            if (data && data.objectid) {
+                addAttachment(data.objectid, data);
+            }
+        });
+
+        // knowledge/cards may repeat objectid in iframe data, script JSON, and query strings; collect all then dedupe.
+        const objectIdPattern = /"objectid"\s*:\s*"([^"]+)"/gi;
+        for (const match of html.matchAll(objectIdPattern)) {
+            addAttachment(match[1], { objectid: match[1] });
         }
 
-        // Use the same opt-in attribute as the native document viewer.
-        for (const frame of doc.querySelectorAll('iframe[download="1"][data][src]')) {
-            let viewer;
-            try {
-                viewer = new URL(frame.getAttribute('src'), CARDS_URL);
-            } catch {
-                continue;
-            }
-            if (viewer.origin !== new URL(CARDS_URL).origin || viewer.pathname !== '/ananas/modules/pdf/index.html') {
-                continue;
-            }
-            const data = parseAttachmentData(frame.getAttribute('data'));
-            if (data && typeof data.objectid === 'string' && /^[a-f0-9]{32}$/i.test(data.objectid)) {
-                byObjectId.set(data.objectid, data);
-            }
+        const singleQuotePattern = /'objectid'\s*:\s*'([^']+)'/gi;
+        for (const match of html.matchAll(singleQuotePattern)) {
+            addAttachment(match[1], { objectid: match[1] });
         }
+
+        const queryPattern = /objectid=([0-9a-f]{32})/gi;
+        for (const match of html.matchAll(queryPattern)) {
+            addAttachment(match[1], { objectid: match[1] });
+        }
+
         return Array.from(byObjectId.values());
     }
 
@@ -890,6 +954,11 @@ SOFTWARE.
                 color: #475569;
                 font-size: 11px;
             }
+            #${UI_ID} .cxpdf-resource-kind.cxpdf-kind-fallback {
+                border: 1px solid #fed7aa;
+                background: #fff7ed;
+                color: #c2410c;
+            }
             #${UI_ID} .cxpdf-file-name {
                 overflow: hidden;
                 text-overflow: ellipsis;
@@ -980,10 +1049,14 @@ SOFTWARE.
         const downloadableChapterCount = groupList.reduce((count, group) => (
             group.hasDownloads ? count + 1 : count
         ), 0);
+        const originalCount = state.results.filter((item) => (item.downloadMode || resolveDownloadMode(item)) === 'original').length;
+        const previewCount = state.results.length - originalCount;
 
         return {
             groups: groupList,
             fileCount: state.results.length,
+            originalCount,
+            previewCount,
             chapterCount: groupList.length,
             downloadableChapterCount,
             selectedFileCount,
@@ -1019,9 +1092,13 @@ SOFTWARE.
     }
 
     function resourceKind(item) {
-        const extension = originalExtension(item);
-        if (['ppt', 'pptx', 'pdf'].includes(extension)) {
-            return item.isDownloadable ? extension.toUpperCase() : `${extension.toUpperCase()} · 无原文件地址`;
+        const mode = item.downloadMode || resolveDownloadMode(item);
+        const extension = itemExtensionHint(item);
+        if (mode === 'original') {
+            return extension.toUpperCase();
+        }
+        if (mode === 'pdf-preview') {
+            return extension && extension !== 'pdf' ? `${extension.toUpperCase()} → PDF 预览` : 'PDF 预览';
         }
         return extension.toUpperCase() || item.type || item.suffix || item.status || '资源';
     }
@@ -1031,7 +1108,7 @@ SOFTWARE.
             state.selectedFileIds = new Set(state.results.map((item) => item.objectid).filter(Boolean));
             state.selectedChapterIds = new Set(
                 resultGroups()
-                    .filter((group) => group.items.length)
+                    .filter((group) => group.hasDownloads)
                     .map((group) => group.chapter.knowledgeid)
             );
         } else {
@@ -1155,10 +1232,13 @@ SOFTWARE.
 
             content.appendChild(actions);
 
+            const fileSummary = model.previewCount > 0
+                ? `共 ${fileCount} 个课件（原件 ${model.originalCount}，PDF 预览 ${model.previewCount}）`
+                : `共 ${fileCount} 个原文件`;
             const meta = createElement(
                 'div',
                 'cxpdf-meta',
-                `courseid=${state.courseid || '-'}，clazzid=${state.clazzid || '-'}，章节 ${chapterCount}/${state.chapters.length || 0}，已选 ${selectedChapterCount} 章 / ${selectedFileCount} 个原文件，共 ${fileCount} 个原文件`
+                `courseid=${state.courseid || '-'}，clazzid=${state.clazzid || '-'}，章节 ${chapterCount}/${state.chapters.length || 0}，已选 ${selectedChapterCount} 章 / ${selectedFileCount} 个，${fileSummary}`
             );
             content.appendChild(meta);
 
@@ -1207,7 +1287,7 @@ SOFTWARE.
                     checkbox.checked = group.selected;
                     checkbox.indeterminate = group.partiallySelected;
                     checkbox.disabled = !group.hasDownloads || state.downloading;
-                    checkbox.title = !group.hasDownloads ? '当前章节无可下载的 PPT/PPTX/PDF 原文件' : checkbox.disabled ? '下载进行中' : '切换当前章节选择';
+                    checkbox.title = !group.hasDownloads ? '当前章节无可下载的 PPT/PPTX/PDF 或 PDF 预览课件' : checkbox.disabled ? '下载进行中' : '切换当前章节选择';
                     checkbox.addEventListener('change', () => {
                         if (checkbox.checked) {
                             downloadableItems.forEach((item) => state.selectedFileIds.add(item.objectid));
@@ -1219,12 +1299,12 @@ SOFTWARE.
                         render();
                     });
                     choice.appendChild(checkbox);
-                    choice.appendChild(createElement('span', 'cxpdf-selected-badge', !group.hasDownloads ? '无原件' : group.selected ? '已选' : group.partiallySelected ? '部分' : '未选'));
+                    choice.appendChild(createElement('span', 'cxpdf-selected-badge', !group.hasDownloads ? '无课件' : group.selected ? '已选' : group.partiallySelected ? '部分' : '未选'));
                     choice.appendChild(createElement('span', 'cxpdf-chapter-title', group.chapter.title));
                     head.appendChild(choice);
                     const countText = shouldDisplayOtherResources()
-                        ? `${downloadableItems.length} 个原文件 / ${group.items.length} 个资源`
-                        : group.hasDownloads ? `${downloadableItems.length} 个原文件` : '无原文件';
+                        ? `${downloadableItems.length} 个可下载 / ${group.items.length} 个资源`
+                        : group.hasDownloads ? `${downloadableItems.length} 个课件` : '无可下载课件';
                     head.appendChild(createElement('div', 'cxpdf-count', countText));
                     chapter.appendChild(head);
 
@@ -1254,7 +1334,10 @@ SOFTWARE.
 
                         const file = createElement('div');
                         const fileName = createElement('div', 'cxpdf-file-name', item.filename || item.objectid);
-                        fileName.appendChild(createElement('span', 'cxpdf-resource-kind', resourceKind(item)));
+                        const kindClass = item.downloadMode === 'pdf-preview'
+                            ? 'cxpdf-resource-kind cxpdf-kind-fallback'
+                            : 'cxpdf-resource-kind';
+                        fileName.appendChild(createElement('span', kindClass, resourceKind(item)));
                         file.appendChild(fileName);
                         file.appendChild(createElement('div', 'cxpdf-small', item.objectid));
                         row.appendChild(file);
@@ -1495,13 +1578,18 @@ SOFTWARE.
         }
     }
 
-    function appendOriginalResult(chapter, attachment, statusResult, eventName) {
+    function appendOriginalResult(chapter, attachment, statusResult, eventName, downloadMode) {
+        const mode = downloadMode || resolveDownloadMode(Object.assign({}, statusResult, {
+            attachment_name: attachment.name,
+            type: statusResult.type || attachment.type,
+        }));
         statusResult.knowledgeid = chapter.knowledgeid;
         statusResult.chapter_title = chapter.title;
         statusResult.attachment_name = attachment.name;
         statusResult.filename = statusResult.filename || attachment.name || `${attachment.objectid}`;
         statusResult.type = statusResult.type || attachment.type;
-        statusResult.isDownloadable = true;
+        statusResult.downloadMode = mode;
+        statusResult.isDownloadable = mode !== 'none';
         state.results.push(statusResult);
         state.selectedFileIds.add(statusResult.objectid);
         logInfo(eventName, {
@@ -1509,9 +1597,9 @@ SOFTWARE.
             chapterTitle: chapter.title,
             objectid: statusResult.objectid,
             filename: statusResult.filename,
+            downloadMode: mode,
             hasDownload: Boolean(statusResult.download),
             hasPreview: Boolean(statusResult.pdf),
-            hasHttp: Boolean(statusResult.http),
         });
         requestRender();
     }
@@ -1549,21 +1637,25 @@ SOFTWARE.
     }
 
     function appendStatusResult(chapter, attachment, statusResult) {
+        const candidate = Object.assign({}, statusResult, {
+            attachment_name: attachment.name,
+            type: statusResult.type || attachment.type,
+        });
+        const downloadMode = resolveDownloadMode(candidate);
         const item = Object.assign({}, statusResult, {
             knowledgeid: chapter.knowledgeid,
             chapter_title: chapter.title,
             attachment_name: attachment.name,
             filename: statusResult.filename || attachment.name || `${attachment.objectid}`,
             type: statusResult.type || attachment.type,
-            isDownloadable: isDownloadableOriginal(Object.assign({}, statusResult, {
-                attachment_name: attachment.name,
-                type: statusResult.type || attachment.type,
-            })),
+            downloadMode,
+            isDownloadable: downloadMode !== 'none',
             output_json: buildOutputJson(chapter, attachment, statusResult),
         });
         state.statusResults.push(statusResult.raw_json);
         state.resourceResults.push(item);
         requestRender();
+        return downloadMode;
     }
 
     async function collectChapterOriginalResults(chapter, attachments, seenObjectIds, eventName, scanToken) {
@@ -1584,22 +1676,18 @@ SOFTWARE.
                 if (scanToken && !isActiveScan(scanToken)) {
                     return false;
                 }
-                appendStatusResult(chapter, attachment, statusResult);
-                if (!isDownloadableOriginal(Object.assign({}, statusResult, {
-                    attachment_name: attachment.name,
-                    type: statusResult.type || attachment.type,
-                }))) {
-                    logWarn('SCAN skipped: not an available PPT/PPTX/PDF original', {
+                const downloadMode = appendStatusResult(chapter, attachment, statusResult);
+                if (downloadMode === 'none') {
+                    logWarn('SCAN skipped: no downloadable original or PDF preview', {
                         knowledgeid: chapter.knowledgeid,
                         chapterTitle: chapter.title,
                         objectid: statusResult.objectid,
                         status: statusResult.status,
-                        statusJson: statusResult.raw_json,
                     });
                     continue;
                 }
 
-                appendOriginalResult(chapter, attachment, statusResult, eventName);
+                appendOriginalResult(chapter, attachment, statusResult, eventName, downloadMode);
             } catch (error) {
                 logError('SCAN status failed', error, {
                     knowledgeid: chapter.knowledgeid,
@@ -1646,7 +1734,7 @@ SOFTWARE.
             addLog(`识别到 ${chapters.length} 个章节`);
 
             const seenObjectIds = new Set();
-            console.time('[Chaoxing PDF Dumper] elapsed');
+            console.time(`${LOG_PREFIX} elapsed`);
             timerStarted = true;
 
             for (const chapter of chapters) {
@@ -1673,7 +1761,7 @@ SOFTWARE.
                 }
             }
 
-            console.timeEnd('[Chaoxing PDF Dumper] elapsed');
+            console.timeEnd(`${LOG_PREFIX} elapsed`);
             timerEnded = true;
             logGroup('SCAN complete', {
                 courseid,
@@ -1682,14 +1770,14 @@ SOFTWARE.
                 originalCount: state.results.length,
             }, scanResultRows());
             logOutputJson();
-            addLog(`扫描完成，找到 ${state.results.length} 个原文件`);
+            addLog(`扫描完成，找到 ${state.results.length} 个可下载课件`);
         } catch (error) {
             logError('SCAN failed', error, { courseid: state.courseid, clazzid: state.clazzid });
             addLog(`失败：${describeError(error)}`);
         } finally {
             if (timerStarted && !timerEnded) {
                 try {
-                    console.timeEnd('[Chaoxing PDF Dumper] elapsed');
+                    console.timeEnd(`${LOG_PREFIX} elapsed`);
                 } catch (error) {
                     // Ignore missing timer differences between browsers.
                 }
@@ -1743,7 +1831,7 @@ SOFTWARE.
                 originalCount: state.results.length,
             }, scanResultRows());
             logOutputJson();
-            addLog(`当前章节扫描完成，找到 ${state.results.length} 个原文件`);
+            addLog(`当前章节扫描完成，找到 ${state.results.length} 个可下载课件`);
         } catch (error) {
             logError('SCAN current chapter failed', error, { courseid: state.courseid, clazzid: state.clazzid });
             addLog(`失败：${describeError(error)}`);
@@ -1780,7 +1868,7 @@ SOFTWARE.
         return '';
     }
 
-    function downloadWithBlob(url, name) {
+    function downloadWithBlob(url, name, mode) {
         return new Promise((resolve, reject) => {
             let settled = false;
             let task = null;
@@ -1834,7 +1922,17 @@ SOFTWARE.
 
                         let objectUrl = '';
                         try {
-                            // Blob download lets the script keep the server-returned filename instead of relying on URL hints.
+                            if (!(response.response instanceof Blob)) {
+                                rejectOnce(createRequestError(`下载响应无效: ${name}`, {
+                                    type: 'empty-blob',
+                                    status: response.status,
+                                    url,
+                                    name,
+                                    responseHeaders: response.responseHeaders || '',
+                                }));
+                                return;
+                            }
+                            // Blob download lets the script keep the resolved filename instead of relying on URL hints.
                             const blob = new Blob([response.response], { type: originalMimeType(name) });
                             const contentLength = Number(responseHeaderValue(response.responseHeaders, 'content-length')) || 0;
                             if (!blob.size) {
@@ -1848,7 +1946,7 @@ SOFTWARE.
                                 }));
                                 return;
                             }
-                            await validateOriginalBlob(blob, name);
+                            await validateOriginalBlob(blob, name, mode);
                             // Validation reads asynchronously. Cancellation must still prevent saving.
                             if (settled || state.cancelDownloadRequested) {
                                 rejectOnce(createRequestError(`下载已取消: ${name}`, { type: 'abort', name }));
@@ -1940,14 +2038,44 @@ SOFTWARE.
     }
 
     function downloadCandidates(item) {
-        // pdf/http may be converted previews. They must never be saved as an original PPTX.
-        return isDownloadableOriginal(item) ? [item.download] : [];
+        const mode = resolveDownloadMode(item);
+        if (mode === 'original') {
+            const list = [{
+                url: item.download.trim(),
+                mode: 'original',
+                name: buildDownloadName(item, 'original'),
+                isRuntimeFallback: false,
+            }];
+            if (hasHttpUrl(item.pdf)) {
+                list.push({
+                    url: item.pdf.trim(),
+                    mode: 'pdf-preview',
+                    name: buildDownloadName(item, 'pdf-preview'),
+                    isRuntimeFallback: true,
+                });
+            }
+            return list;
+        }
+        if (mode === 'pdf-preview') {
+            return [{
+                url: item.pdf.trim(),
+                mode: 'pdf-preview',
+                name: buildDownloadName(item, 'pdf-preview'),
+                isRuntimeFallback: false,
+            }];
+        }
+        return [];
     }
 
-    function buildDownloadName(item) {
+    function buildDownloadName(item, modeOverride) {
+        const mode = modeOverride || item.downloadMode || resolveDownloadMode(item);
         let filename = sanitizeFilename(
             item.filename || item.attachment_name || item.chapter_title || item.knowledgeid || 'download'
         );
+        if (mode === 'pdf-preview') {
+            const stripped = filename.replace(FALLBACK_STRIP_EXT_RE, '') || 'download';
+            return sanitizeFilename(`${stripped}.pdf`);
+        }
         const extension = originalExtension(item);
         if (extension && !/\.[a-z0-9]+$/i.test(filename)) {
             filename = sanitizeFilename(`${filename}.${extension}`);
@@ -1964,22 +2092,50 @@ SOFTWARE.
         return types[originalExtension({ filename: name })] || 'application/octet-stream';
     }
 
-    async function validateOriginalBlob(blob, name) {
+    function hasPdfMagicBytes(bytes) {
+        const signature = [0x25, 0x50, 0x44, 0x46, 0x2d];
+        if (bytes.length < signature.length) {
+            return false;
+        }
+        const limit = bytes.length - signature.length;
+        for (let offset = 0; offset <= limit; offset += 1) {
+            if (signature.every((byte, idx) => bytes[offset + idx] === byte)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    async function validateOriginalBlob(blob, name, mode) {
         const bytes = new Uint8Array(await blob.slice(0, 1024).arrayBuffer());
         const startsWith = (signature) => signature.every((byte, index) => bytes[index] === byte);
         const isZip = startsWith([0x50, 0x4b, 0x03, 0x04]);
         const isOle = startsWith([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
-        const isPdf = startsWith([0x25, 0x50, 0x44, 0x46, 0x2d]);
+        const isPdf = hasPdfMagicBytes(bytes);
         const extension = originalExtension({ filename: name });
+        const expectedPdf = mode === 'pdf-preview' || extension === 'pdf';
         // Password-encrypted Office files can also use an OLE container.
-        const valid = extension === 'pptx' ? (isZip || isOle)
-            : extension === 'ppt' ? isOle
-                : extension === 'pdf' ? isPdf : false;
+        const valid = expectedPdf ? isPdf
+            : extension === 'pptx' ? (isZip || isOle)
+                : extension === 'ppt' ? isOle : false;
         if (!valid) {
-            throw createRequestError(`返回内容不是 ${extension.toUpperCase()} 原文件：${name}。请重新扫描后重试。`, {
-                type: 'invalid-file', name,
+            const reason = (!expectedPdf && isPdf) ? 'pdf-body-for-non-pdf' : 'unexpected-header';
+            throw createRequestError(`返回内容不是预期的 ${(expectedPdf ? 'pdf' : extension).toUpperCase()} 文件：${name}。`, {
+                type: 'invalid-file',
+                reason,
+                name,
             });
         }
+    }
+
+    function canFallbackToPdfPreview(error) {
+        if (!error) {
+            return false;
+        }
+        if (error.type === 'http' && [403, 404, 410].includes(error.status)) {
+            return true;
+        }
+        return error.type === 'invalid-file' && error.reason === 'pdf-body-for-non-pdf';
     }
 
     async function downloadItem(item) {
@@ -1992,7 +2148,7 @@ SOFTWARE.
             return;
         }
 
-        const name = buildDownloadName(item);
+        const name = candidates[0].name;
         state.downloading = true;
         state.cancelDownloadRequested = false;
         render();
@@ -2003,9 +2159,9 @@ SOFTWARE.
             candidateCount: candidates.length,
         });
         try {
-            await downloadWithFallback(candidates, name);
-            logInfo('DOWNLOAD single submitted', { name });
-            addLog(`已提交下载：${name}`);
+            const result = await downloadWithFallback(candidates, name);
+            logInfo('DOWNLOAD single submitted', result);
+            addLog(result.fellBack ? `原文件不可下载，已回退保存为 PDF 预览：${result.name}` : `已提交下载：${result.name}`);
         } catch (error) {
             logError('DOWNLOAD single failed', error, {
                 objectid: item.objectid,
@@ -2022,29 +2178,34 @@ SOFTWARE.
         }
     }
 
-    async function downloadWithFallback(candidates, name) {
+    async function downloadWithFallback(candidates, itemName) {
         let lastError = null;
 
-        for (const url of candidates) {
+        for (let index = 0; index < candidates.length; index += 1) {
+            const candidate = candidates[index];
             if (state.cancelDownloadRequested) {
-                throw createRequestError(`下载已取消: ${name}`, { type: 'abort', name });
+                throw createRequestError(`下载已取消: ${candidate.name}`, { type: 'abort', name: candidate.name });
             }
 
             try {
-                logInfo('DOWNLOAD original start', { name });
-                await downloadWithBlob(url, name);
-                logInfo('DOWNLOAD original submitted', { name });
-                return;
+                logInfo('DOWNLOAD candidate start', { name: candidate.name, mode: candidate.mode, isRuntimeFallback: candidate.isRuntimeFallback });
+                await downloadWithBlob(candidate.url, candidate.name, candidate.mode);
+                logInfo('DOWNLOAD candidate submitted', { name: candidate.name, mode: candidate.mode });
+                return { name: candidate.name, mode: candidate.mode, fellBack: Boolean(candidate.isRuntimeFallback) };
             } catch (error) {
                 if (state.cancelDownloadRequested || error.type === 'abort') {
                     throw error;
                 }
                 lastError = error;
-                logWarn('DOWNLOAD candidate failed', { name, url, error });
+                const hasNextFallback = index + 1 < candidates.length && candidates[index + 1].isRuntimeFallback && canFallbackToPdfPreview(error);
+                logWarn('DOWNLOAD candidate failed', { name: candidate.name, mode: candidate.mode, willFallback: hasNextFallback, error });
+                if (!hasNextFallback) {
+                    throw error;
+                }
             }
         }
 
-        throw lastError || new Error(`下载失败: ${name}`);
+        throw lastError || new Error(`下载失败: ${itemName}`);
     }
 
     async function downloadAll() {
@@ -2072,6 +2233,7 @@ SOFTWARE.
             })));
 
             let submittedCount = 0;
+            const failedItems = [];
             for (let index = 0; index < items.length; index += 1) {
                 if (state.cancelDownloadRequested) {
                     logWarn('DOWNLOAD batch cancelled before item', {
@@ -2090,18 +2252,40 @@ SOFTWARE.
                     continue;
                 }
 
-                const name = buildDownloadName(item);
+                const name = candidates[0].name;
                 addLog(`下载 ${index + 1}/${items.length}：${name}`);
-                await downloadWithFallback(candidates, name);
-                submittedCount += 1;
-                await new Promise((resolve) => setTimeout(resolve, 300));
+                try {
+                    const result = await downloadWithFallback(candidates, name);
+                    submittedCount += 1;
+                    if (result.fellBack) {
+                        addLog(`已回退保存为 PDF 预览：${result.name}`);
+                    }
+                    await new Promise((resolve) => setTimeout(resolve, 300));
+                } catch (itemError) {
+                    if (state.cancelDownloadRequested || itemError.type === 'abort') {
+                        throw itemError;
+                    }
+                    failedItems.push({ name, error: describeError(itemError) });
+                    logError('DOWNLOAD batch item failed', itemError, {
+                        objectid: item.objectid,
+                        filename: item.filename,
+                        name,
+                    });
+                    addLog(`跳过失败文件 (${index + 1}/${items.length})：${name} — ${describeError(itemError)}`);
+                }
             }
 
             logInfo('DOWNLOAD batch complete', {
                 submittedCount,
+                failedCount: failedItems.length,
                 total: items.length,
+                failedItems,
             });
-            addLog(`批量下载已提交 ${submittedCount} 个任务`);
+            if (failedItems.length) {
+                addLog(`批量下载完成：成功 ${submittedCount} 个，失败 ${failedItems.length} 个（详见控制台日志）`);
+            } else {
+                addLog(`批量下载完成，已提交 ${submittedCount} 个任务`);
+            }
         } catch (error) {
             if (state.cancelDownloadRequested) {
                 logWarn('DOWNLOAD batch cancelled during active item', error);
@@ -2151,7 +2335,7 @@ SOFTWARE.
                 }
                 addLog(successMessage || '接口 JSON 已复制到剪贴板');
             } catch (fallbackError) {
-                console.log('[Chaoxing PDF Dumper] copy fallback:', text);
+                console.log(`${LOG_PREFIX} copy fallback:`, text);
                 logWarn('COPY failed', { error, fallbackError });
                 addLog('复制失败，JSON 已输出到控制台');
             } finally {
@@ -2217,7 +2401,7 @@ SOFTWARE.
 
         ['pushState', 'replaceState'].forEach((method) => {
             const original = history[method];
-            if (original && original.__cxpdfDumperPatched) {
+            if (original && original.__cxorigDownloaderPatched) {
                 return;
             }
             history[method] = function (...args) {
@@ -2225,8 +2409,8 @@ SOFTWARE.
                 notify();
                 return result;
             };
-            history[method].__cxpdfDumperPatched = true;
-            history[method].__cxpdfDumperOriginal = original;
+            history[method].__cxorigDownloaderPatched = true;
+            history[method].__cxorigDownloaderOriginal = original;
         });
 
         window.addEventListener('popstate', notify);
@@ -2234,7 +2418,7 @@ SOFTWARE.
     }
 
     function start() {
-        window.ChaoxingPdfDumper = {
+        window.ChaoxingOriginalDownloader = {
             name: SCRIPT_NAME,
             version: SCRIPT_VERSION,
             iconUrl: SCRIPT_ICON_URL,
